@@ -1,7 +1,6 @@
 import argparse
 import os
 import time
-import json
 
 import torch
 from torchvision import transforms
@@ -22,6 +21,8 @@ def main(args):
     img_path = args.test_path
     assert os.path.exists(weights_path), f"weights {weights_path} not found."
     assert os.path.exists(img_path), f"image {img_path} not found."
+    mean = (0.419, 0.432, 0.447)
+    std = (0.084, 0.082, 0.082)
     # get devices
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"using {device} device.")
@@ -38,10 +39,8 @@ def main(args):
     original_img = Image.open(img_path)
 
     # from pil image to tensor and normalize
-    data_transform = transforms.Compose([transforms.Resize(520),
-                                         transforms.ToTensor(),
-                                         transforms.Normalize(mean=(0.485, 0.456, 0.406),
-                                                              std=(0.229, 0.224, 0.225))])
+    data_transform = transforms.Compose([transforms.ToTensor(),
+                                         transforms.Normalize(mean=mean, std=std)])
     img = data_transform(original_img)
     # expand batch dimension
     img = torch.unsqueeze(img, dim=0)

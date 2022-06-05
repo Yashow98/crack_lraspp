@@ -13,7 +13,7 @@ import transforms as T
 class SegmentationPresetTrain:
     def __init__(self, base_size, crop_size, hflip_prob=0.5, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         min_size = int(0.5 * base_size)
-        max_size = int(2.0 * base_size)
+        max_size = int(1.2 * base_size)
 
         trans = [T.RandomResize(min_size, max_size)]
         if hflip_prob > 0:
@@ -30,9 +30,11 @@ class SegmentationPresetTrain:
 
 
 class SegmentationPresetEval:
-    def __init__(self, base_size, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+    """
+    验证集的数据处理
+    """
+    def __init__(self, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         self.transforms = T.Compose([
-            T.RandomResize(base_size, base_size),
             T.ToTensor(),
             T.Normalize(mean=mean, std=std),
         ])
@@ -41,12 +43,9 @@ class SegmentationPresetEval:
         return self.transforms(img, target)
 
 
-def get_transform(train):
-    base_size = 480
-    crop_size = 480
-
-    return SegmentationPresetTrain(base_size, crop_size) if train else SegmentationPresetEval(base_size)
-
+def get_transform(train, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+    return SegmentationPresetTrain(480, 480, mean=mean, std=std) if train else SegmentationPresetEval(mean=mean,
+                                                                                                      std=std)
 
 def create_model(num_classes, pretrain):
     model = lraspp_mobilenetv3_large(num_classes=num_classes)
@@ -54,7 +53,7 @@ def create_model(num_classes, pretrain):
     if pretrain:
         weights_dict = torch.load("./lraspp_mobilenet_v3_large.pth", map_location='cpu')
 
-        if num_classes != 2:
+        if num_classes != 21:
             # 如果训练自己的数据集，将和类别相关的权重删除，防止权重shape不一致报错
             for k in list(weights_dict.keys()):
                 if "low_classifier" in k or "high_classifier" in k:
@@ -75,16 +74,18 @@ def main(args):
     # segmentation nun_classes + background
     num_classes = args.num_classes + 1
 
+    mean = (0.419, 0.432, 0.447)
+    std = (0.084, 0.082, 0.082)
     # 用来保存训练以及验证过程中信息
     results_file = f'results{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.txt'
 
     train_dataset = DriveDataset(args.data_path,
                                  train=True,
-                                 transforms=get_transform(train=True))
+                                 transforms=get_transform(train=True, mean=mean, std=std))
 
     val_dataset = DriveDataset(args.data_path,
                                train=False,
-                               transforms=get_transform(train=False))
+                               transforms=get_transform(train=False, mean=mean, std=std))
 
     num_workers = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
     train_loader = torch.utils.data.DataLoader(train_dataset,
@@ -127,23 +128,26 @@ def main(args):
         if args.amp:
             scaler.load_state_dict(checkpoint["scaler"])
 
+    best_dice = 0.
     best_mIou = 0.
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        mean_loss, lr = train_one_epoch(model, optimizer, train_loader, device, epoch,
+        mean_loss, lr = train_one_epoch(model, optimizer, train_loader, device, epoch, num_classes,
                                         lr_scheduler=lr_scheduler, print_freq=args.print_freq, scaler=scaler)
 
-        confmat = evaluate(model, val_loader, device=device, num_classes=num_classes)
+        confmat, dice = evaluate(model, val_loader, device=device, num_classes=num_classes)
         val_info = str(confmat)
-        print(val_info)
         mIou = val_info.split(':')[-1].strip()
         mIou = float(mIou)
+        print(val_info)
+        print(f"dice coefficient: {dice:.3f}")
         # write into txt
         with open(results_file, "a") as f:
             # 记录每个epoch对应的train_loss、lr以及验证集各指标
             train_info = f"[epoch: {epoch}]\n" \
                          f"train_loss: {mean_loss:.4f}\n" \
-                         f"lr: {lr:.6f}\n"
+                         f"lr: {lr:.6f}\n" \
+                         f"dice coefficient: {dice:.3f}\n"
             f.write(train_info + val_info + "\n\n")
 
         save_file = {"model": model.state_dict(),
@@ -153,9 +157,13 @@ def main(args):
                      "args": args}
         if args.amp:
             save_file["scaler"] = scaler.state_dict()
+
+        if best_mIou < mIou:
+            best_mIou = mIou
+
         if args.save_best:
-            if best_mIou < mIou:
-                best_mIou = mIou
+            if best_dice < dice:
+                best_dice = dice
                 torch.save(save_file, "save_weights/best_model.pth")
         else:
             torch.save(save_file, f"save_weights/model_{epoch}.pth")
@@ -164,7 +172,8 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"training time {total_time_str}")
     print(f'the best mIou is {best_mIou}')
-    print('Finished training')
+    print(f'the best dice is {best_dice:3f}')
+    print('Finished Training')
 
 
 def parse_args():
@@ -176,7 +185,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda", help="training device")
     parser.add_argument("-b", "--batch-size", default=6, type=int)
     parser.add_argument('--enable-pretrained', default=False, type=bool)
-    parser.add_argument("--epochs", default=100, type=int, metavar="N",
+    parser.add_argument("--epochs", default=200, type=int, metavar="N",
                         help="number of total epochs to train")
 
     parser.add_argument('--lr', default=0.01, type=float, help='initial learning rate')

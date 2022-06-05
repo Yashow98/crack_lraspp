@@ -2,10 +2,13 @@ from collections import defaultdict, deque
 import datetime
 import time
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 import errno
 import os
+
+from .dice_coefficient_loss import multiclass_dice_coeff, build_target
 
 
 class SmoothedValue(object):
@@ -122,6 +125,45 @@ class ConfusionMatrix(object):
                 iu.mean().item() * 100)
 
 
+class DiceCoefficient(object):
+    def __init__(self, num_classes: int = 2, ignore_index: int = -100):
+        self.cumulative_dice = None
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.count = None
+
+    def update(self, pred, target):
+        if self.cumulative_dice is None:
+            self.cumulative_dice = torch.zeros(1, dtype=pred.dtype, device=pred.device)
+        if self.count is None:
+            self.count = torch.zeros(1, dtype=pred.dtype, device=pred.device)
+        # compute the Dice score, ignoring background
+        pred = F.one_hot(pred.argmax(dim=1), self.num_classes).permute(0, 3, 1, 2).float()
+        dice_target = build_target(target, self.num_classes, self.ignore_index)
+        self.cumulative_dice += multiclass_dice_coeff(pred[:, 1:], dice_target[:, 1:], ignore_index=self.ignore_index)
+        self.count += 1
+
+    @property
+    def value(self):
+        return 0 if self.count == 0 else self.cumulative_dice / self.count
+
+    def reset(self):
+        if self.cumulative_dice is not None:
+            self.cumulative_dice.zero_()
+
+        if self.count is not None:
+            self.count.zeros_()
+
+    def reduce_from_all_processes(self):
+        if not torch.distributed.is_available():
+            return
+        if not torch.distributed.is_initialized():
+            return
+        torch.distributed.barrier()
+        torch.distributed.all_reduce(self.cumulative_dice)
+        torch.distributed.all_reduce(self.count)
+
+
 class MetricLogger(object):
     def __init__(self, delimiter="\t"):
         self.meters = defaultdict(SmoothedValue)
@@ -139,15 +181,10 @@ class MetricLogger(object):
             return self.meters[attr]
         if attr in self.__dict__:
             return self.__dict__[attr]
-        raise AttributeError("'{}' object has no attribute '{}'".format(
-            type(self).__name__, attr))
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attr}'")
 
     def __str__(self):
-        loss_str = []
-        for name, meter in self.meters.items():
-            loss_str.append(
-                "{}: {}".format(name, str(meter))
-            )
+        loss_str = [f"{name}: {str(meter)}" for name, meter in self.meters.items()]
         return self.delimiter.join(loss_str)
 
     def synchronize_between_processes(self):
@@ -158,14 +195,13 @@ class MetricLogger(object):
         self.meters[name] = meter
 
     def log_every(self, iterable, print_freq, header=None):
-        i = 0
         if not header:
             header = ''
         start_time = time.time()
         end = time.time()
         iter_time = SmoothedValue(fmt='{avg:.4f}')
         data_time = SmoothedValue(fmt='{avg:.4f}')
-        space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
+        space_fmt = f':{len(str(len(iterable)))}d'
         if torch.cuda.is_available():
             log_msg = self.delimiter.join([
                 header,
@@ -186,7 +222,7 @@ class MetricLogger(object):
                 'data: {data}'
             ])
         MB = 1024.0 * 1024.0
-        for obj in iterable:
+        for i, obj in enumerate(iterable):
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
@@ -204,11 +240,10 @@ class MetricLogger(object):
                         i, len(iterable), eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time)))
-            i += 1
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('{} Total time: {}'.format(header, total_time_str))
+        print(f'{header} Total time: {total_time_str}')
 
 
 def mkdir(path):
@@ -243,15 +278,11 @@ def is_dist_avail_and_initialized():
 
 
 def get_world_size():
-    if not is_dist_avail_and_initialized():
-        return 1
-    return dist.get_world_size()
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
 
 
 def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
 
 
 def is_main_process():
@@ -271,9 +302,7 @@ def init_distributed_mode(args):
     elif 'SLURM_PROCID' in os.environ:
         args.rank = int(os.environ['SLURM_PROCID'])
         args.gpu = args.rank % torch.cuda.device_count()
-    elif hasattr(args, "rank"):
-        pass
-    else:
+    elif not hasattr(args, "rank"):
         print('Not using distributed mode')
         args.distributed = False
         return
@@ -282,8 +311,7 @@ def init_distributed_mode(args):
 
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
-    print('| distributed init (rank {}): {}'.format(
-        args.rank, args.dist_url), flush=True)
+    print(f'| distributed init (rank {args.rank}): {args.dist_url}', flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                          world_size=args.world_size, rank=args.rank)
     setup_for_distributed(args.rank == 0)
